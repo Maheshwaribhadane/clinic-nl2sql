@@ -1,26 +1,78 @@
 import re
 import sqlite3
-from fastapi import FastAPI
+import time
+import logging
+import json
+from collections import defaultdict
+from datetime import datetime
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator
 from vanna_setup import get_agent
 from vanna.core.user import User, RequestContext
+import plotly.express as px
+import plotly.graph_objects as go
+import pandas as pd
 
-app = FastAPI(title="Clinic NL2SQL API")
+# ============================================================
+# BONUS 5: STRUCTURED LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("nl2sql")
 
+# ============================================================
+# BONUS 3: QUERY CACHE
+# ============================================================
+query_cache = {}
+CACHE_MAX_SIZE = 100
+
+# ============================================================
+# BONUS 4: RATE LIMITING
+# ============================================================
+rate_limit_store = defaultdict(list)
+RATE_LIMIT = 10        # max requests
+RATE_WINDOW = 60       # per 60 seconds
+
+app = FastAPI(
+    title="Clinic NL2SQL API",
+    description="AI-powered Natural Language to SQL system using Vanna 2.0 + Gemini",
+    version="1.0.0"
+)
+
+# ============================================================
+# RATE LIMIT MIDDLEWARE
+# ============================================================
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path == "/chat":
+        client_ip = request.client.host
+        now = time.time()
+        # Remove old requests outside window
+        rate_limit_store[client_ip] = [
+            t for t in rate_limit_store[client_ip]
+            if now - t < RATE_WINDOW
+        ]
+        if len(rate_limit_store[client_ip]) >= RATE_LIMIT:
+            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "message": f"Rate limit exceeded. Max {RATE_LIMIT} requests per {RATE_WINDOW} seconds.",
+                    "retry_after": RATE_WINDOW
+                }
+            )
+        rate_limit_store[client_ip].append(now)
+    return await call_next(request)
+
+# ============================================================
+# SQL VALIDATION
+# ============================================================
 BLOCKED = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "EXEC",
            "XP_", "SP_", "GRANT", "REVOKE", "SHUTDOWN", "SQLITE_MASTER"]
-
-# Full database schema for context
-DB_SCHEMA = """
-Tables in clinic.db:
-- patients(id, first_name, last_name, email, phone, date_of_birth, gender, city, registered_date)
-- doctors(id, name, specialization, department, phone)
-- appointments(id, patient_id, doctor_id, appointment_date, status, notes)
-  status values: 'Scheduled', 'Completed', 'Cancelled', 'No-Show'
-- treatments(id, appointment_id, treatment_name, cost, duration_minutes)
-- invoices(id, patient_id, invoice_date, total_amount, paid_amount, status)
-  status values: 'Paid', 'Pending', 'Overdue'
-"""
 
 def validate_sql(sql: str):
     sql_upper = sql.upper()
@@ -30,7 +82,6 @@ def validate_sql(sql: str):
         if kw in sql_upper:
             return False, f"Blocked keyword: {kw}"
     return True, "ok"
-
 
 def extract_sql(text: str) -> str:
     patterns = [
@@ -48,7 +99,6 @@ def extract_sql(text: str) -> str:
                 return sql
     return ""
 
-
 def run_sql(sql: str):
     try:
         clean = ' '.join(sql.split())
@@ -62,8 +112,74 @@ def run_sql(sql: str):
     except Exception as e:
         return [], [], str(e)
 
+# ============================================================
+# BONUS 1: CHART GENERATION
+# ============================================================
+def generate_chart(columns, rows, question):
+    """Generate a Plotly chart based on the data and question"""
+    try:
+        if not rows or not columns or len(columns) < 2:
+            return None
 
-# Predefined SQL for all 20 questions as fallback
+        df = pd.DataFrame(rows, columns=columns)
+        question_lower = question.lower()
+        chart_json = None
+        chart_type = None
+
+        # Detect numeric columns
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        text_cols = [c for c in columns if c not in numeric_cols]
+
+        if not numeric_cols:
+            return None
+
+        x_col = text_cols[0] if text_cols else columns[0]
+        y_col = numeric_cols[0]
+
+        # Choose chart type based on question
+        if any(w in question_lower for w in ["trend", "month", "over time", "monthly", "registration"]):
+            fig = px.line(df, x=x_col, y=y_col,
+                         title=f"Trend: {y_col} by {x_col}",
+                         color_discrete_sequence=["#2E75B6"])
+            chart_type = "line"
+        elif any(w in question_lower for w in ["top", "most", "highest", "busiest", "revenue by", "count by"]):
+            fig = px.bar(df, x=x_col, y=y_col,
+                        title=f"{y_col} by {x_col}",
+                        color=y_col,
+                        color_continuous_scale="Blues")
+            chart_type = "bar"
+        elif any(w in question_lower for w in ["percentage", "percent", "%", "pie", "distribution"]):
+            fig = px.pie(df, names=x_col, values=y_col,
+                        title=f"Distribution of {y_col}")
+            chart_type = "pie"
+        elif any(w in question_lower for w in ["average", "avg", "cost", "spending"]):
+            fig = px.bar(df, x=x_col, y=y_col,
+                        title=f"Average {y_col} by {x_col}",
+                        color_discrete_sequence=["#1F4E79"])
+            chart_type = "bar"
+        else:
+            fig = px.bar(df, x=x_col, y=y_col,
+                        title=f"{y_col} by {x_col}",
+                        color_discrete_sequence=["#2E75B6"])
+            chart_type = "bar"
+
+        fig.update_layout(
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            font=dict(family="Arial", size=12),
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+
+        chart_json = json.loads(fig.to_json())
+        return chart_json, chart_type
+
+    except Exception as e:
+        logger.error(f"Chart generation error: {e}")
+        return None
+
+# ============================================================
+# FALLBACK SQL MAP
+# ============================================================
 QUESTION_SQL_MAP = {
     "how many patients": "SELECT COUNT(*) AS total_patients FROM patients",
     "list all doctors": "SELECT name, specialization, department FROM doctors",
@@ -88,7 +204,6 @@ QUESTION_SQL_MAP = {
     "patient registration trend": "SELECT strftime('%Y-%m', registered_date) AS month, COUNT(*) AS new_patients FROM patients GROUP BY month ORDER BY month",
 }
 
-
 def find_sql_from_map(question: str) -> str:
     question_lower = question.lower()
     for key, sql in QUESTION_SQL_MAP.items():
@@ -96,7 +211,9 @@ def find_sql_from_map(question: str) -> str:
             return sql
     return ""
 
-
+# ============================================================
+# BONUS 2: INPUT VALIDATION MODEL
+# ============================================================
 class ChatRequest(BaseModel):
     question: str
 
@@ -104,18 +221,50 @@ class ChatRequest(BaseModel):
     def check_question(cls, v):
         if not v or not v.strip():
             raise ValueError("Question cannot be empty.")
+        if len(v.strip()) < 3:
+            raise ValueError("Question too short. Please ask a complete question.")
         if len(v) > 500:
-            raise ValueError("Question too long.")
+            raise ValueError("Question too long. Max 500 characters.")
+        if not re.search(r'[a-zA-Z]', v):
+            raise ValueError("Question must contain letters.")
         return v.strip()
 
-
+# ============================================================
+# ENDPOINTS
+# ============================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "database": "connected", "agent_memory_items": 15}
+    logger.info("Health check requested")
+    return {
+        "status": "ok",
+        "database": "connected",
+        "agent_memory_items": 15,
+        "cache_size": len(query_cache),
+        "timestamp": datetime.now().isoformat()
+    }
 
+@app.get("/cache/clear")
+def clear_cache():
+    query_cache.clear()
+    logger.info("Cache cleared")
+    return {"message": "Cache cleared successfully", "cache_size": 0}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    start_time = time.time()
+    logger.info(f"Question received: {req.question}")
+
+    # BONUS 3: Check cache first
+    cache_key = req.question.lower().strip()
+    if cache_key in query_cache:
+        logger.info(f"Cache HIT for: {req.question}")
+        cached = query_cache[cache_key].copy()
+        cached["cached"] = True
+        cached["response_time_ms"] = round((time.time() - start_time) * 1000, 2)
+        return cached
+
+    logger.info("Cache MISS — calling Vanna agent")
+
     agent, memory = get_agent()
     try:
         user = User(id="default_user", name="Clinic User")
@@ -141,57 +290,90 @@ async def chat(req: ChatRequest):
 
         full_text = '\n'.join(all_content)
 
-        # Try extracting SQL from full text
         if not sql:
             sql = extract_sql(full_text)
 
-        # Fallback: use predefined SQL map
         if not sql:
             sql = find_sql_from_map(req.question)
 
-        # Clean message
         msg = re.sub(r'<execute_sql>[\s\S]*?</execute_sql>', '', full_text, flags=re.IGNORECASE)
         msg = re.sub(r'```[\s\S]*?```', '', msg, flags=re.IGNORECASE)
         msg = msg.strip() or "Query processed."
 
         if not sql:
-            return {"message": msg or "Could not generate SQL.",
-                    "sql_query": "", "columns": [], "rows": [], "row_count": 0}
+            return {
+                "message": "Could not generate SQL for this question.",
+                "sql_query": "", "columns": [], "rows": [], "row_count": 0,
+                "chart": None, "chart_type": None, "cached": False
+            }
 
-        # Validate
         valid, reason = validate_sql(sql)
         if not valid:
-            return {"message": f"Blocked: {reason}", "sql_query": sql,
-                    "columns": [], "rows": [], "row_count": 0}
+            logger.warning(f"SQL blocked: {reason} | SQL: {sql}")
+            return {
+                "message": f"Blocked: {reason}",
+                "sql_query": sql, "columns": [], "rows": [],
+                "row_count": 0, "chart": None, "chart_type": None, "cached": False
+            }
 
-        # Execute
         columns, rows, error = run_sql(sql)
+
         if error:
-            return {"message": f"SQL Error: {error}", "sql_query": sql,
-                    "columns": [], "rows": [], "row_count": 0}
-        # Execute
-        columns, rows, error = run_sql(sql)
-        if error:
-            # Try fallback SQL from map
             fallback_sql = find_sql_from_map(req.question)
             if fallback_sql and fallback_sql != sql:
                 columns, rows, error2 = run_sql(fallback_sql)
                 if not error2:
-                   sql = fallback_sql
-                   error = None
-            if error:
-                return {"message": f"SQL Error: {error}", "sql_query": sql,"columns": [], "rows": [], "row_count": 0}
+                    sql = fallback_sql
+                    error = None
 
-        return {
+        if error:
+            logger.error(f"SQL execution error: {error}")
+            return {
+                "message": f"SQL Error: {error}", "sql_query": sql,
+                "columns": [], "rows": [], "row_count": 0,
+                "chart": None, "chart_type": None, "cached": False
+            }
+
+        # BONUS 1: Generate chart
+        chart_data = None
+        chart_type = None
+        if rows and columns:
+            chart_result = generate_chart(columns, rows, req.question)
+            if chart_result:
+                chart_data, chart_type = chart_result
+                logger.info(f"Chart generated: {chart_type}")
+
+        elapsed = round((time.time() - start_time) * 1000, 2)
+        logger.info(f"Query completed in {elapsed}ms | rows={len(rows)} | sql={sql[:80]}")
+
+        response = {
             "message": msg,
             "sql_query": sql,
             "columns": columns,
             "rows": rows,
-            "row_count": len(rows)
+            "row_count": len(rows),
+            "chart": chart_data,
+            "chart_type": chart_type,
+            "cached": False,
+            "response_time_ms": elapsed
         }
+
+        # BONUS 3: Store in cache
+        if len(query_cache) >= CACHE_MAX_SIZE:
+            oldest_key = next(iter(query_cache))
+            del query_cache[oldest_key]
+        query_cache[cache_key] = response.copy()
+        logger.info(f"Response cached. Cache size: {len(query_cache)}")
+
+        return response
 
     except Exception as e:
         import traceback
-        return {"message": f"Error: {str(e)}", "sql_query": "",
-                "columns": [], "rows": [], "row_count": 0,
-                "trace": traceback.format_exc()}
+        logger.error(f"Unexpected error: {str(e)}")
+        return {
+            "message": f"Error: {str(e)}",
+            "sql_query": "", "columns": [], "rows": [],
+            "row_count": 0, "chart": None, "chart_type": None,
+            "cached": False, "trace": traceback.format_exc()
+        }
+    
