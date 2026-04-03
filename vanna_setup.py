@@ -12,7 +12,10 @@ from vanna.integrations.local.agent_memory import DemoAgentMemory
 from vanna.integrations.google import GeminiLlmService
 
 DB_PATH = "clinic.db"
-GOOGLE_API_KEY = "AIzaSyCExx42FHtQ5_t1_fNcQLHisdN0f-qCNdw"
+import os
+from dotenv import load_dotenv
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 _agent = None
 _memory = None
